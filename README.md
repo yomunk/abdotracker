@@ -1,4 +1,5 @@
 abdotracker
 ===========
 
-Camera based abdomen tracking for closed loop insect flight research
+Provides real-time tracking of insect abdomen position from camera images, using
+OpenCV for processing and ZeroMQ for communication.
