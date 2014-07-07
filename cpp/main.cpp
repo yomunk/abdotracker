@@ -10,9 +10,6 @@
 using namespace::cv;
 using namespace::std;
 
-ofstream SaveFile("dotstats.csv");
-
-
 Mat mothframe; // image frame of video
 Mat mothframe0;
 Mat mothframe1; //blurred image
@@ -26,8 +23,6 @@ int largestcontour; //variable for storing largest contour
 double largestcontourarea; //variable for storing largest contour area
 float rectcenter[2]; //points used to save/send center of minrect around tracked object
 int framenumber = 0; //frame number
-string fileorigin = "whiteout/whiteout-";  //used to find file name
-string file = fileorigin;
 int thresholdvalue = 200; //starting threshold
 bool reached = false; //used to indicate if threshold has been found
 int window[2]= {335, 210}; //starting roi coords, region should be in shape
@@ -53,16 +48,7 @@ double findbiggest(vector<vector<Point> > vector) //returns contour number with 
 	}
 	return  max;
 }
-void filename() //iterates through files, gets the file name, dependent on file location
-{
-	file = "whiteout/img/f";
-	ostringstream convert;
-	convert<< setw (5) << setfill('0') <<framenumber;
-	string number = convert.str();
-	file.append(number);
-	file.append(".jpg");
-	//cout<<file;
-}
+
 void imageprocess() //does all the image computation
 {
 	//mothframe = mothframe0;
@@ -124,26 +110,35 @@ void findthresh()
 	hierarchy.clear();
 	}
 }
-void saveandsendcoordinates() //saves coordinates to txt file
+void saveandsendcoordinates(zmq::socket_t publisher) //saves coordinates to txt file
 {
-	//SaveFile<<"Contour, Contour Area, Contour Center, Rectangle Size"<<endl;
-		//SaveFile<<largestcontour<<" , "<<largestcontourarea<<" , "<<rectangle1.center<<"  , "<<rectangle1.size<<endl;
 	rectcenter[0] = window[0];
 	rectcenter[1] = window[1];
-	SaveFile<<rectcenter[0]<<","<<rectcenter[1]<<endl;
-	//insert zmq code
+                //  Send message to all subscribers
+        zmq::message_t message(20);
+        snprintf ((char *) message.data(), 20 ,
+            "%f %f", rectcenter[0], rectcenter[1]);
+        publisher.send(message);
+
 }
 int main()
 {
-	//VideoCapture cap("video.mp4");   // camera
-	filename();
-	mothframe0 = imread(file);
-	findthresh();// may be good to turn loop in main to independent function and integrate here
+
+        
+        zmq::context_t context (1);
+        zmq::socket_t publisher (context, ZMQ_PUB);
+        publisher.bind("tcp://*:5556");
+        publisher.bind("ipc://abdoment.ipc");
+	
+	VideoCapture cap(0);   // camera
+
+        cap >> mothframe0;
+
+        findthresh();// may be good to turn loop in main to independent function and integrate here
 
 	while(true)
 	{
-	filename();
-	mothframe0 = imread(file);
+        cap >> mothframe0;
 	imageprocess();
 	namedWindow("Window1", CV_WINDOW_AUTOSIZE);
 	namedWindow("Window2", CV_WINDOW_AUTOSIZE);
@@ -157,13 +152,22 @@ int main()
 
 	if(waitKey(20) == 27) //required; escape to quit
 	{
-			break;
+			return 0;
 	}
-	saveandsendcoordinates();
+
+        rectcenter[0] = window[0];
+	rectcenter[1] = window[1];
+                //  Send message to all subscribers
+        printf("%.01f %.01f\n", rectcenter[0], rectcenter[1]);
+        zmq::message_t message(20);
+        snprintf ((char *) message.data(), 20 ,
+            "%f %f\n", rectcenter[0], rectcenter[1]);
+        publisher.send(message);
+
 	contourvector.clear(); //clears stuff
 	hierarchy.clear();
 	framenumber++;
 	}
-	SaveFile.close();
+	//SaveFile.close();
 	return 0;
 }
