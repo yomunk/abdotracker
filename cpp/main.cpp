@@ -3,171 +3,271 @@
 #include <time.h>
 #include <math.h>
 #include <stdlib.h>
-#include <opencv/cv.h>
-#include <opencv/highgui.h>
+#include <opencv2/opencv.hpp>
+#include <opencv2/highgui/highgui.hpp>
 #include <zmq.hpp>
 
 using namespace::cv;
 using namespace::std;
+Point mousepoints; //used to record mouse clicks. the contour center is sent relative to this point
 
-Mat mothframe; // image frame of video
-Mat mothframe0;
-Mat mothframe1; //blurred image
-Mat mothframe2; //converted frame by threshold
-Mat mothframe3; // contoured frame
-Rect ROI; //used to define region of interest
-vector<vector<Point> > contourvector; // vector of contour vectors
-vector<Vec4i> hierarchy; //used by canny
-RotatedRect rectangle1; //rectangle used to find center
-int largestcontour; //variable for storing largest contour
-double largestcontourarea; //variable for storing largest contour area
-float rectcenter[2]; //points used to save/send center of minrect around tracked object
-int framenumber = 0; //frame number
-int thresholdvalue = 200; //starting threshold
-bool reached = false; //used to indicate if threshold has been found
-int window[2]= {335, 210}; //starting roi coords, region should be in shape
-int approxlocation[2] = {250,130};
-int windowsize = 200; //roi size
-int currentoffsetx = 335-windowsize; //must take initial window dimensions, used for relating ROI to parent image
-int currentoffsety = 210-windowsize;
-
-double findbiggest(vector<vector<Point> > vector) //returns contour number with greatest area
+void CallbackFunc(int event1, int x, int y, int flags, void* userdata) //function used for mouse clicks
 {
-	double max = 0;
-	double maxarea = 0;
-	int thisarea;
-	for(int i = 0; i < vector.size(); i++)
+	if( event1 == EVENT_LBUTTONDOWN) //if left button clicked
+	{
+	    mousepoints.x = x; //set the point coordinates to the x and y of the mouse
+		mousepoints.y = y;
+	}
+
+}
+
+class tracker
+{
+public:
+	string file;
+
+
+Mat supremewindow; //used later for drawing, not used in computation
+Mat imagewithROI; // image frame of video
+Mat mothframe0; //original frame from video
+Mat blurredimage; //blurred image
+Mat thresholdedframe; //converted frame by threshold
+Mat contouredframe; // contoured frame
+Rect ROI; //used to define region of interest
+vector<vector<Point> > contourvector; // vector of contour vectors used by findcontours
+vector<Vec4i> hierarchy; //used by canny
+RotatedRect Rectaroundcontour; //rectangle used to find center
+int trackedcontour; //variable for storing largest contour
+double trackedcontourarea; //variable for storing largest contour area
+int framenumber; //frame number
+int thresholdvalue; //starting threshold, adjusted
+bool reached; //used to indicate if threshold has been found
+int ROIcenter[2]; //starting roi coords, region should be in shape
+int windowsize; //roi size
+int currentoffsetx;//x must take initial window dimensions, used for relating ROI to parent image
+int currentoffsety; //y
+int mode; //indicates whether the program is in its initial phase
+bool wehavestartedgettingvalues; //if true, contour values have started being collected
+int estimatedarea; //used to initially set which contour should be tracked
+
+tracker(int thresh, int roix, int roiy, int squarewindowwidth, int mode, int estimatedcontourarea) //constructor
+{
+framenumber = 0; //set initial frame to zero
+thresholdvalue = thresh; //starting threshold
+ROIcenter[0] = roix; //x, starting roi coords, region should be within bouts of original image or else will throw error
+ROIcenter[1] = roiy; //y
+windowsize = squarewindowwidth/2; //roi size, ROI will be be 2* windowsize x 2* windowsize
+currentoffsetx = roix-windowsize; //x,s take initial ROI center location, used for relating ROI to parent image
+currentoffsety = roiy-windowsize; //y
+mode = mode; //mode, two options: largest contour(0) or similiar size contour(1)
+wehavestartedgettingvalues = false;
+estimatedarea = estimatedcontourarea; //used to find initial contour that is similiar to estimate, program will later use similiarity test
+
+}
+
+double findthecontouryouwant(vector<vector<Point> > vector) //goes through contourvector, returns contour number, indicating contour that best fits mode
+{
+	double number = 0; //number of important contour
+	double area = 0; //area of important contour
+	int thisarea; //current area
+
+	for(unsigned int i = 0; i < vector.size(); i++)
 	{
 		thisarea = contourArea(vector[i]);
-
-		if(thisarea > maxarea)
+		if(mode == 0 || framenumber == 1) //if mode is 0 or it is the first loop, program finds largest area. This can be changed if the contour area is known
 		{
-			max = i;
-			maxarea = thisarea;
+		if(thisarea > area)
+		{
+			number = i;
+			area = thisarea;
+		}
+		}
+		else if(mode == 1) //if mode is 0, tracks contour with area closest to last one tracked
+		{
+			int lastarea;
+			if(wehavestartedgettingvalues) //if we have gotten a contour size, use
+			{
+			lastarea = trackedcontourarea;
+			}
+			else //use the estimate
+			{
+				lastarea = estimatedarea;
+			}
+			int bestdiff = abs(area - lastarea);
+			int diff = abs(thisarea-lastarea);
+
+			if(diff < bestdiff)
+			{
+				number = i;
+				area = thisarea;
+			}
 		}
 	}
-	return  max;
+	return  number; //returns which contour in the vector you want
 }
-
-void imageprocess() //does all the image computation
+void imageprocesscentr() //does all the image computation
 {
-	//mothframe = mothframe0;
-	if(window[0] > mothframe0.cols - windowsize)
+	int adjustedwindowsize = windowsize; //this can be adjusted each frame if no contours are seen
+	bool iseethatspot = false; //do i see that spot on the moth?
+	bool thresholdneedschange = false;
+	int ticker = 0; //records how many loops have been conducted, used to decide whether to expand ROI or bring down threshold
+	while(!iseethatspot)
 	{
-		window[0] = mothframe0.cols - windowsize;
-	}
-	else if(window[0] < windowsize)
+	ticker++;
+	contourvector.clear(); //clears vector for next frame
+	hierarchy.clear(); //clears vector used for findcontour function
+	//the following lines are used to avoid an ROI out of bounds error; it makes sure that the window will always fit
+	if(ROIcenter[0] > mothframe0.cols - adjustedwindowsize)
 	{
-		window[0] = windowsize;
+		ROIcenter[0] = mothframe0.cols - adjustedwindowsize;
 	}
-	if(window[1] > mothframe0.rows-windowsize)
+	else if(ROIcenter[0] < adjustedwindowsize)
 	{
-		window[1] = mothframe0.rows - windowsize ;
+		ROIcenter[0] = adjustedwindowsize;
 	}
-	else if(window[1] < windowsize)
+	if(ROIcenter[1] > mothframe0.rows-adjustedwindowsize)
 	{
-		window[1] = windowsize;
+		ROIcenter[1] = mothframe0.rows - adjustedwindowsize ;
 	}
-
-	ROI = Rect(window[0]-windowsize, window[1]-windowsize, 2 * windowsize,2 * windowsize);
-	mothframe = mothframe0(ROI);
-
-	currentoffsetx = window[0]- windowsize;
-	currentoffsety = window[1] - windowsize;
-	GaussianBlur(mothframe,mothframe1, Size(31,31),0,0); //blurs image to aid in contour finding
-	threshold(mothframe1, mothframe2, thresholdvalue, 255, THRESH_BINARY); // thresholds image to create black and white
-	Canny(mothframe2,mothframe3, 1,255, 3); //marks edjes of blurred image
-	findContours(mothframe3, contourvector, hierarchy, CV_RETR_TREE, CV_CHAIN_APPROX_SIMPLE, Point(0,0)); //finds and stores contours
-
-
-	if(contourvector.size() > 0)
+	else if(ROIcenter[1] < adjustedwindowsize)
 	{
-	largestcontour = findbiggest(contourvector);
-
-	largestcontourarea = contourArea(contourvector[largestcontour]);
-	rectangle1 = minAreaRect(contourvector[largestcontour]); //finds rectangle to find center
-	circle(mothframe, rectangle1.center, 10 ,Scalar(150,150,150),3,8,0); //draws circle
-
-	window[0] = rectangle1.center.x + currentoffsetx; //would be used for region of interest
-	window[1] = rectangle1.center.y + currentoffsety;
+		ROIcenter[1] = adjustedwindowsize;
 	}
+	///////////////////////////////////////////////////
+	currentoffsetx = ROIcenter[0]- adjustedwindowsize;  //upper left corner of ROI-x
+	currentoffsety = ROIcenter[1] - adjustedwindowsize; //upper left corner of ROI-y
+
+	ROI = Rect(ROIcenter[0]-adjustedwindowsize, ROIcenter[1]-adjustedwindowsize, 2 * adjustedwindowsize,2 * adjustedwindowsize); //create the region of interes
+	imagewithROI= mothframe0(ROI); //set image with ROI to that ROI of the image
+
+
+	GaussianBlur(imagewithROI,blurredimage, Size(31,31),0,0); //blurs image to aid in contour finding, size refers to kernel size
+	threshold(blurredimage, thresholdedframe, thresholdvalue, 255, THRESH_BINARY); // thresholds image to create black and white
+	Canny(thresholdedframe,contouredframe, 1,255, 3); //marks edjes of blurred image
+	findContours(contouredframe, contourvector, hierarchy, CV_RETR_TREE, CV_CHAIN_APPROX_SIMPLE, Point(0,0)); //finds and stores contours
+
+
+	if(contourvector.size() > 0) //if we see some contours
+	{
+	if(!wehavestartedgettingvalues)
+	{
+		wehavestartedgettingvalues = true; //CONGRATULATIONS! the first contour data has been collected!
+	}
+	trackedcontour = findthecontouryouwant(contourvector); //find the one with the biggest area
+
+	trackedcontourarea = contourArea(contourvector[trackedcontour]);
+	Rectaroundcontour = minAreaRect(contourvector[trackedcontour]); //finds rectangle to find center
+
+
+
+	ROIcenter[0] = Rectaroundcontour.center.x + currentoffsetx; //finds new ROI center x coord
+	ROIcenter[1] = Rectaroundcontour.center.y + currentoffsety; //finds new ROI center y coord
+
+	//cout<<"contour is seen"<<endl;
+	iseethatspot = true; //note that the spot is seen, loop broken
+	if(contourvector.size() > 3) //in this case, 3 is used because it allows for an occaisonal disturbance without disprupting the current threshold
+	{
+		thresholdvalue++; //if we have more than one contour, make the threshold more exclusive
+
+	}
+
+	}
+	else //if not one contour is seen
+	{
+	//	cout<<"no contours are seen"<<endl;
+
+
+		if(ticker < 4 || ticker > 8)
+		{
+				if(adjustedwindowsize < mothframe0.rows/2 - 10) //as long as the ROI window can fit comfortable in the imahe
+		{
+		adjustedwindowsize = adjustedwindowsize + 10;  //increase the window size
+				}
+				else
+				{
+					thresholdvalue -= 2;
+				}
+		}
+		else
+		{
+
+			thresholdvalue -= 2;
+		}
+
+	}
+
+
+
+	}
+
+
 
 }
-void findthresh()
-{
-	while(!reached)
-	{
-	imageprocess();
-	if(abs(rectangle1.center.x - approxlocation[0]) < 50 && abs(rectangle1.center.y - approxlocation[1]) < 50)
-	{
-		thresholdvalue--;
-	}
-	else
-	{
-		reached = true;
-	}
-	contourvector.clear(); //clears stuff
-	hierarchy.clear();
-	}
-}
-void saveandsendcoordinates(zmq::socket_t publisher) //saves coordinates to txt file
-{
-	rectcenter[0] = window[0];
-	rectcenter[1] = window[1];
-                //  Send message to all subscribers
-        zmq::message_t message(20);
-        snprintf ((char *) message.data(), 20 ,
-            "%f %f", rectcenter[0], rectcenter[1]);
-        publisher.send(message);
+};
 
-}
+
+
+
+
+
+
+
+
+
 int main()
 {
-
-        
         zmq::context_t context (1);
         zmq::socket_t publisher (context, ZMQ_PUB);
         publisher.bind("tcp://*:5556");
-        publisher.bind("ipc://abdoment.ipc");
-	
-	VideoCapture cap(0);   // camera
 
-        cap >> mothframe0;
+	 namedWindow("mainwindow", CV_WINDOW_AUTOSIZE); //names window
+	namedWindow("contours", CV_WINDOW_AUTOSIZE); //names window
+	setMouseCallback("mainwindow", CallbackFunc, NULL); //sets mouse callback function, defined earlier
+tracker program = tracker(200, 350, 200, 160, 1, 60); //creates tracker object
+	VideoCapture cap(0); //camera
+	if(!cap.isOpened()) //check to see if camera is found
+	{
+		cout<<"Camera not found."<<endl;
+		return -1; //if not, exit
+	}
 
-        findthresh();// may be good to turn loop in main to independent function and integrate here
 
 	while(true)
 	{
-        cap >> mothframe0;
-	imageprocess();
-	namedWindow("Window1", CV_WINDOW_AUTOSIZE);
-	namedWindow("Window2", CV_WINDOW_AUTOSIZE);
-	namedWindow("Window3", CV_WINDOW_AUTOSIZE);
-	namedWindow("Window4", CV_WINDOW_AUTOSIZE);
 
-	imshow("Window1", mothframe); //displays windows
-	imshow("Window2", mothframe1);
-	imshow("Window3", mothframe0);
-	imshow("Window4", mothframe3);
 
+        Mat original;
+	cap>>original;  //get latest frame
+        cvtColor(original, program.mothframe0, CV_RGB2GRAY);
+	//program.filename();
+	//program.mothframe0 = imread(program.file);
+	program.imageprocesscentr(); //process frame
+	//cout<<"Current Thresh: "<<program.thresholdvalue<<endl;
+	program.framenumber++; //increase frame number
+
+
+	program.supremewindow = program.mothframe0; //again, used to draw on
+			circle(program.supremewindow, Point(program.ROIcenter[0], program.ROIcenter[1]), 10, Scalar(0,80,0),3,8,0); //draw circle around center on supreme window,
+	line(program.supremewindow, mousepoints, Point(program.ROIcenter[0], program.ROIcenter[1]),Scalar(0,80,0),3,8,0); //and a line from it to the relative point
+
+	imshow("mainwindow", program.supremewindow); //displays window
+	imshow("contours", program.contouredframe); //displays window
+
+
+
+	int SENDX = program.ROIcenter[0]-mousepoints.x; //sends the x and y coordinates of the largest contour center relative to the point selected by mouse
+	int SENDY = program.ROIcenter[1]-mousepoints.y;
+
+        zmq::message_t message(20);
+        snprintf ((char *) message.data(), 20, "%d %d\n", SENDX, SENDY);
+        publisher.send(message);
 	if(waitKey(20) == 27) //required; escape to quit
 	{
-			return 0;
+			break; //if esc key, break--REQUIRED FOR OPENCV TO SHOW IMAGES
 	}
-
-        rectcenter[0] = window[0];
-	rectcenter[1] = window[1];
-                //  Send message to all subscribers
-        printf("%.01f %.01f\n", rectcenter[0], rectcenter[1]);
-        zmq::message_t message(20);
-        snprintf ((char *) message.data(), 20 ,
-            "%f %f\n", rectcenter[0], rectcenter[1]);
-        publisher.send(message);
-
-	contourvector.clear(); //clears stuff
-	hierarchy.clear();
-	framenumber++;
 	}
-	//SaveFile.close();
-	return 0;
+return 0; //ALL DONE!
 }
+
+
+
